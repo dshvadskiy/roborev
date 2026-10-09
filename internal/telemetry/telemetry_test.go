@@ -301,14 +301,26 @@ func TestNewReporterUsesSharedDailyClaims(t *testing.T) {
 	db := testutil.OpenTestDB(t)
 	path := filepath.Join(t.TempDir(), "daily.json")
 	endpoint, messages := testutil.NewPostHogStub(t)
-	for range 2 {
+	for _, surface := range []string{SurfaceWeb, SurfaceTUI} {
 		reporter, err := NewReporter(Options{Database: db, Endpoint: endpoint, DailyClaimsPath: path})
 		require.NoError(t, err)
 		limiter := &AppOpenedLimiter{Database: db}
-		assert.Equal(t, http.StatusAccepted, postThroughLimiter(limiter, reporter, `{"event":"screen_viewed","properties":{"screen":"queue","surface":"tui"}}`).Code)
+		body := `{"event":"screen_viewed","properties":{"screen":"reviews","surface":"` + surface + `"}}`
+		assert.Equal(t, http.StatusAccepted, postThroughLimiter(limiter, reporter, body).Code)
+		if surface == SurfaceTUI {
+			assert.Equal(t, http.StatusAccepted, postThroughLimiter(limiter, reporter, `{"event":"screen_viewed","properties":{"screen":"analytics","surface":"web"}}`).Code)
+			for _, body := range []string{`{"event":"screen_viewed"}`, `{"event":"screen_viewed","properties":{"screen":123}}`, `{"event":"screen_viewed","properties":{"screen":"unknown"}}`} {
+				assert.Equal(t, http.StatusBadRequest, postThroughLimiter(limiter, reporter, body).Code)
+			}
+		}
 		require.NoError(t, reporter.Close())
 	}
-	assert.Len(t, messages(), 1)
+	require.Len(t, messages(), 2)
+	assert.Equal(t, "reviews", messages()[0].Properties[PropertyScreen])
+	assert.Equal(t, "analytics", messages()[1].Properties[PropertyScreen])
+	stored, err := db.GetSyncState("telemetry.screen.reviews")
+	require.NoError(t, err)
+	assert.Empty(t, stored)
 }
 
 func TestNewReporterOrDisabledErrorFallbackAdmitsNothing(t *testing.T) {

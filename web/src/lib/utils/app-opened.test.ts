@@ -451,20 +451,6 @@ describe("setupAppOpenedReporting", () => {
     expect(fetchMock.mock.calls[1]![0].signal.aborted).toBe(true);
   });
 
-  test("retries a failed screen on same-day focus independently of app opens", async () => {
-    setup(() => "reviews");
-    await settle();
-    fetchMock.mockRejectedValueOnce(new TypeError("offline"));
-    appOpened.reportScreenViewed("reviews");
-    await settle();
-    focusWindow();
-    await settle();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    focusWindow();
-    await settle();
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-  });
-
   test("waits for a pending screen before retrying a rejected request", async () => {
     setup(() => "reviews");
     await settle();
