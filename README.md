@@ -482,6 +482,11 @@ TUI screens are `queue`, `review`, `prompt`, `filter`, `comment`,
 `column-options`, `release-notes` and `rerun-agent`. Each screen counts once
 per install per UTC day across interfaces, including daemon restarts. Screen
 names contain no paths, job IDs, filter text or review contents.
+Kit saves daily screen reservations in `telemetry-daily.json` beside the daemon
+database before queueing a report. Counts mean queue acceptance, not confirmed
+delivery to PostHog. Failed reports retry on later TUI input or browser focus
+and navigation. The initial TUI queue counts after acceptance; a loaded review
+in a split pane counts both `queue` and `review`, whichever pane has focus.
 Agent activity counts each MCP `tools/call`, including tool errors, and each
 invocation of `agent-hook run`, `agent-hook fix-done`, `post-commit`, `enqueue`,
 `remap`, or an eligible daemon command marked `--from-skill` after its first

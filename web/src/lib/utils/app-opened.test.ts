@@ -272,12 +272,14 @@ describe("setupAppOpenedReporting", () => {
 
   test("ignores focus later on the same UTC day", async () => {
     setup(() => "reviews");
+    appOpened.reportScreenViewed("reviews");
+    await settle();
     focusWindow();
     vi.setSystemTime(new Date("2026-03-10T20:00:00Z"));
     focusWindow();
     await settle();
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   test("posts again on the first focus of the next UTC day only", async () => {
@@ -414,11 +416,11 @@ describe("setupAppOpenedReporting", () => {
     appOpened.reportScreenViewed(screen);
     appOpened.reportScreenViewed("reviews");
     await settle();
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     vi.setSystemTime(new Date("2026-03-11T08:00:00Z"));
     focusWindow();
     await settle();
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     const bodies = await Promise.all(
       fetchMock.mock.calls.map(async ([request]) =>
         JSON.parse(await request.text()),
@@ -428,7 +430,7 @@ describe("setupAppOpenedReporting", () => {
       bodies
         .filter((body) => body.event === "screen_viewed")
         .map((body) => body.properties.screen),
-    ).toEqual(["reviews", "analytics", "reviews", "analytics"]);
+    ).toEqual(["reviews", "analytics", "analytics"]);
   });
 
   test("bounds screen requests while preserving app-open transport", async () => {
@@ -447,5 +449,40 @@ describe("setupAppOpenedReporting", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0]![0].signal.aborted).toBe(false);
     expect(fetchMock.mock.calls[1]![0].signal.aborted).toBe(true);
+  });
+
+  test("retries a failed screen on same-day focus independently of app opens", async () => {
+    setup(() => "reviews");
+    await settle();
+    fetchMock.mockRejectedValueOnce(new TypeError("offline"));
+    appOpened.reportScreenViewed("reviews");
+    await settle();
+    focusWindow();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    focusWindow();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  test("waits for a pending screen before retrying a rejected request", async () => {
+    setup(() => "reviews");
+    await settle();
+    let reject!: (reason: Error) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    appOpened.reportScreenViewed("reviews");
+    focusWindow();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    reject(new TypeError("offline"));
+    await settle();
+    focusWindow();
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });

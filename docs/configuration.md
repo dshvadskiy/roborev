@@ -1753,7 +1753,12 @@ screens are `queue`, `review`, `prompt`, `filter`, `comment`, `commit-msg`,
 `help`, `log`, `tasks`, `worktree-confirm`, `patch`, `column-options`,
 `release-notes` and `rerun-agent`. Each screen counts once per install per UTC
 day across interfaces, including daemon restarts. Screen names contain no paths,
-job IDs, filter text or review contents.
+job IDs, filter text or review contents. Kit saves daily screen reservations in
+`telemetry-daily.json` beside the daemon database before queueing a report.
+Counts mean queue acceptance, not confirmed delivery to PostHog. Failed reports
+retry on later TUI input or browser focus and navigation. The initial TUI queue
+counts after acceptance; a loaded review in a split pane counts both `queue` and
+`review`, whichever pane has focus.
 
 Each event carries `install_age_hours`, the whole hours since the install ID was
 created, so short-lived installs such as test sandboxes can be filtered out.

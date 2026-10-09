@@ -17,7 +17,10 @@ import (
 	"go.kenn.io/roborev/internal/telemetry"
 )
 
-type screenRecordingTransport struct{ screens []string }
+type screenRecordingTransport struct {
+	screens []string
+	fail    bool
+}
 
 func (s *screenRecordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Path == "/api/telemetry/events" {
@@ -29,7 +32,77 @@ func (s *screenRecordingTransport) RoundTrip(req *http.Request) (*http.Response,
 		}
 		s.screens = append(s.screens, event.Properties[telemetry.PropertyScreen])
 	}
-	return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+	status := http.StatusAccepted
+	if s.fail {
+		status = http.StatusServiceUnavailable
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"status":"queued"}`)), Header: make(http.Header)}, nil
+}
+
+//nolint:paralleltest // t.Setenv of telemetry opt-out variables
+func TestInitialScreenFailureRetriesOnInput(t *testing.T) {
+	enableTelemetryEnv(t)
+	m := newModel(testEndpointFromURL("http://127.0.0.1:7373"), withExternalIODisabled())
+	transport := &screenRecordingTransport{fail: true}
+	m.client.Transport = transport
+	result, _ := m.Update(m.reportScreenViewed()())
+	m = result.(model)
+	transport.fail = false
+	result, cmd := m.Update(keyPressMsg('x'))
+	m = result.(model)
+	for _, msg := range collectMsgs(cmd) {
+		result, _ = m.Update(msg)
+		m = result.(model)
+	}
+	assert.Equal(t, []string{"queue", "queue"}, transport.screens)
+	_, cmd = m.Update(keyPressMsg('x'))
+	collectMsgs(cmd)
+	assert.Len(t, transport.screens, 2)
+}
+
+//nolint:paralleltest // t.Setenv of telemetry opt-out variables
+func TestScreenDeliveryWaitsForAcceptanceOnMatchingDay(t *testing.T) {
+	enableTelemetryEnv(t)
+	m := newModel(testEndpointFromURL("http://127.0.0.1:7373"), withExternalIODisabled())
+	transport := &screenRecordingTransport{}
+	m.client.Transport = transport
+	_, cmd := m.Update(keyPressMsg('x'))
+	collectMsgs(cmd)
+	assert.Empty(t, transport.screens)
+	assert.Empty(t, m.screensSent)
+	result, _ := m.Update(screenDeliveryMsg{screen: "queue", day: m.screenDay})
+	m = result.(model)
+	assert.Equal(t, []string{"queue"}, m.screensSent)
+	assert.Empty(t, m.screensPending)
+	m.screensSent = nil
+	m.screensPending = []string{"queue"}
+	result, _ = m.Update(screenDeliveryMsg{screen: "queue", day: "2000-01-01"})
+	m = result.(model)
+	assert.Empty(t, m.screensSent)
+	assert.Equal(t, []string{"queue"}, m.screensPending)
+}
+
+//nolint:paralleltest // t.Setenv of telemetry opt-out variables
+func TestFailedScreenRetriesWhenReopened(t *testing.T) {
+	enableTelemetryEnv(t)
+	m := newModel(testEndpointFromURL("http://127.0.0.1:7373"), withExternalIODisabled())
+	transport := &screenRecordingTransport{fail: true}
+	m.client.Transport = transport
+	update := func() {
+		result, cmd := m.Update(keyPressMsg('?'))
+		m = result.(model)
+		for _, msg := range collectMsgs(cmd) {
+			result, _ = m.Update(msg)
+			m = result.(model)
+		}
+	}
+	update()
+	assert.Empty(t, m.screensSent)
+	transport.fail = false
+	update()
+	update()
+	assert.Equal(t, []string{"help", "help"}, transport.screens)
+	assert.Equal(t, []string{"help"}, m.screensSent)
 }
 
 //nolint:paralleltest // t.Setenv of telemetry opt-out variables

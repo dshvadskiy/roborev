@@ -14,6 +14,8 @@ let hiddenAt: number | undefined;
 let hiddenTimer: ReturnType<typeof setTimeout> | undefined;
 export type Screen = "reviews" | "analytics";
 let currentScreen: (() => Screen) | undefined;
+const deliveredScreens = new Map<Screen, string>();
+const pendingScreens = new Set<string>();
 
 function pauseSession(): void {
   if (started === undefined) return;
@@ -102,6 +104,10 @@ function postEvent(
 }
 
 export function reportScreenViewed(screen: Screen): void {
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `${day}:${screen}`;
+  if (deliveredScreens.get(screen) === day || pendingScreens.has(key)) return;
+  pendingScreens.add(key);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   void postEvent(
@@ -109,14 +115,26 @@ export function reportScreenViewed(screen: Screen): void {
     { screen, surface: "web" },
     { signal: controller.signal },
   )
+    .then((result) => {
+      const status = (result as { status?: string } | undefined)?.status;
+      if (
+        day === new Date().toISOString().slice(0, 10) &&
+        (status === "queued" || status === "skipped" || status === "disabled")
+      )
+        deliveredScreens.set(screen, day);
+    })
     .catch(() => undefined)
-    .finally(() => clearTimeout(timeout));
+    .finally(() => {
+      pendingScreens.delete(key);
+      clearTimeout(timeout);
+    });
 }
 
 // Without a mounted shell there is no session to post with, so the focus waits for the shell to return.
 function onFocus(): void {
   if (shellMounted) {
-    if (reportAppOpened() && currentScreen) reportScreenViewed(currentScreen());
+    reportAppOpened();
+    if (currentScreen) reportScreenViewed(currentScreen());
   } else focusPending = true;
 }
 

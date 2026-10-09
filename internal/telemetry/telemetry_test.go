@@ -12,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	kittelemetry "go.kenn.io/kit/telemetry"
+	kittelemetry "go.kenn.io/kit/telemetry/posthog"
 
 	"go.kenn.io/roborev/internal/storage"
 	"go.kenn.io/roborev/internal/testutil"
@@ -136,7 +136,7 @@ func TestAllowedEventOptionsConfigureRoborevDaemonEvents(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
 	t.Setenv(GenericEnabledEnv, "1")
 
-	reporter, err := kittelemetry.NewPostHogReporter(kittelemetry.PostHogOptions{
+	reporter, err := kittelemetry.NewReporter(kittelemetry.Options{
 		APIKey:      "test-posthog-api-key",
 		Application: "roborev",
 		EnvPrefix:   "ROBOREV",
@@ -275,10 +275,14 @@ func TestNewReporterOptedOutKeepsAllowlist(t *testing.T) {
 }
 
 // newPostHogStubReporter returns an enabled reporter and its captured messages.
-func newPostHogStubReporter(t *testing.T) (*Reporter, func() []testutil.PostHogMessage) {
+func newPostHogStubReporter(t *testing.T, paths ...string) (*Reporter, func() []testutil.PostHogMessage) {
 	t.Helper()
 	endpoint, messages := testutil.NewPostHogStub(t)
-	reporter, err := kittelemetry.NewPostHogReporter(kittelemetry.PostHogOptions{
+	path := filepath.Join(t.TempDir(), "daily.json")
+	if len(paths) > 0 {
+		path = paths[0]
+	}
+	reporter, err := kittelemetry.NewReporter(kittelemetry.Options{
 		APIKey:      "test-posthog-api-key",
 		Application: "roborev",
 		EnvPrefix:   "ROBOREV",
@@ -286,9 +290,25 @@ func newPostHogStubReporter(t *testing.T) (*Reporter, func() []testutil.PostHogM
 		Version:     "test-version",
 		Source:      "daemon",
 		Endpoint:    endpoint,
-	}, allowedEventOptions()...)
+	}, append(allowedEventOptions(), kittelemetry.WithDailyEvent(EventScreenViewed, PropertyScreen, kittelemetry.NewDailyClaims(path)))...)
 	require.NoError(t, err)
 	return reporter, messages
+}
+
+func TestNewReporterUsesSharedDailyClaims(t *testing.T) {
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv(GenericEnabledEnv, "1")
+	db := testutil.OpenTestDB(t)
+	path := filepath.Join(t.TempDir(), "daily.json")
+	endpoint, messages := testutil.NewPostHogStub(t)
+	for range 2 {
+		reporter, err := NewReporter(Options{Database: db, Endpoint: endpoint, DailyClaimsPath: path})
+		require.NoError(t, err)
+		limiter := &AppOpenedLimiter{Database: db}
+		assert.Equal(t, http.StatusAccepted, postThroughLimiter(limiter, reporter, `{"event":"screen_viewed","properties":{"screen":"queue","surface":"tui"}}`).Code)
+		require.NoError(t, reporter.Close())
+	}
+	assert.Len(t, messages(), 1)
 }
 
 func TestNewReporterOrDisabledErrorFallbackAdmitsNothing(t *testing.T) {
