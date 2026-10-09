@@ -46,6 +46,7 @@ func (l *AppOpenedLimiter) Handler(reporter *Reporter) http.Handler {
 		// Hand kit the bytes already read plus the rest, so its size and decode answers stay its own.
 		r.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(body), r.Body), Closer: r.Body}
 		var skip bool
+		var canonical []byte
 		if len(body) <= appOpenedMaxBodyBytes {
 			var event struct {
 				Event string `json:"event"`
@@ -58,7 +59,7 @@ func (l *AppOpenedLimiter) Handler(reporter *Reporter) http.Handler {
 					return
 				}
 			}
-			skip, err = l.alreadySentToday(reporter, body)
+			skip, canonical, err = l.alreadySentToday(reporter, body)
 			if err != nil {
 				http.Error(w, "read telemetry state failed", http.StatusInternalServerError)
 				return
@@ -71,6 +72,10 @@ func (l *AppOpenedLimiter) Handler(reporter *Reporter) http.Handler {
 			_, _ = io.WriteString(w, "{\"status\":\"queued\"}\n")
 			return
 		}
+		if canonical != nil {
+			r.Body = readCloser{Reader: bytes.NewReader(canonical), Closer: r.Body}
+			r.ContentLength = int64(len(canonical))
+		}
 		capture.ServeHTTP(w, r)
 	})
 }
@@ -80,26 +85,26 @@ type readCloser struct {
 	io.Closer
 }
 
-func (l *AppOpenedLimiter) alreadySentToday(reporter *Reporter, body []byte) (bool, error) {
+func (l *AppOpenedLimiter) alreadySentToday(reporter *Reporter, body []byte) (bool, []byte, error) {
 	var req struct {
 		Event      string         `json:"event"`
 		Properties map[string]any `json:"properties"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&req); err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	// Kit rejects data after the JSON object; leave that answer to kit.
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return false, nil
+		return false, nil, nil
 	}
 	req.Event = strings.TrimSpace(req.Event)
 	if (req.Event != EventAppOpened && req.Event != EventScreenViewed) || !reporter.Enabled() {
-		return false, nil
+		return false, nil, nil
 	}
 	props, err := reporter.SanitizeProperties(req.Event, req.Properties)
 	if err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	surface, _ := props[PropertySurface].(string)
 	clock := l.now
@@ -108,23 +113,28 @@ func (l *AppOpenedLimiter) alreadySentToday(reporter *Reporter, body []byte) (bo
 	}
 	day := clock().UTC().Format(time.DateOnly)
 	if req.Event == EventScreenViewed {
+		req.Properties = props
+		canonical, err := json.Marshal(req)
+		if err != nil {
+			return false, nil, err
+		}
 		screen, _ := props[PropertyScreen].(string)
 		if l.Database == nil {
-			return false, errors.New("telemetry database is required")
+			return false, nil, errors.New("telemetry database is required")
 		}
 		stored, err := l.Database.GetSyncState("telemetry.screen." + screen)
-		return stored == day, err
+		return stored == day, canonical, err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.sent[surface] == day {
-		return true, nil
+		return true, nil, nil
 	}
 	if l.sent == nil {
 		l.sent = make(map[string]string)
 	}
 	l.sent[surface] = day
-	return false, nil
+	return false, nil, nil
 }
 
 // PostAppOpened posts app_opened for surface to a daemon capture URL and discards the response; callers gate on EnabledFromEnv.

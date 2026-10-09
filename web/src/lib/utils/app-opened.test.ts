@@ -270,7 +270,7 @@ describe("setupAppOpenedReporting", () => {
     },
   );
 
-  test("ignores focus later on the same UTC day", async () => {
+  test("reports screens on same-day focus while app opens stay daily", async () => {
     setup(() => "reviews");
     appOpened.reportScreenViewed("reviews");
     await settle();
@@ -279,7 +279,7 @@ describe("setupAppOpenedReporting", () => {
     focusWindow();
     await settle();
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   test("posts again on the first focus of the next UTC day only", async () => {
@@ -462,7 +462,7 @@ describe("setupAppOpenedReporting", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     focusWindow();
     await settle();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   test("waits for a pending screen before retrying a rejected request", async () => {

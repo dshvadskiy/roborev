@@ -3,6 +3,7 @@ package telemetry
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -301,4 +302,30 @@ func TestScreenViewedLegacyReadFailureIsRetryable(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, postThroughLimiter(limiter, reporter, `{"event":"screen_viewed","properties":{"screen":"queue"}}`).Code)
 	require.NoError(t, reporter.Close())
 	assert.Empty(t, messages())
+}
+
+func TestScreenViewedCanonicalAliasesPreserveLegacyClaim(t *testing.T) {
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv(GenericEnabledEnv, "1")
+	db := testutil.OpenTestDB(t)
+	reporter, messages := newPostHogStubReporter(t)
+	limiter := &AppOpenedLimiter{Database: db}
+	require.NoError(t, db.SetSyncState("telemetry.screen.queue", time.Now().UTC().Format(time.DateOnly)))
+	body := `{"event":"screen_viewed","properties":{"screen":"queue"," screen ":"review","surface":"web"," surface ":"tui","path":"/private"}}`
+	_, canonical, err := limiter.alreadySentToday(reporter, []byte(body))
+	require.NoError(t, err)
+	var normalized struct {
+		Properties map[string]any `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(canonical, &normalized))
+	assert.NotContains(t, normalized.Properties, " screen ")
+	assert.NotContains(t, normalized.Properties, " surface ")
+	assert.NotContains(t, normalized.Properties, "path")
+	for range 32 {
+		assert.Equal(t, http.StatusAccepted, postThroughLimiter(limiter, reporter, body).Code)
+	}
+	require.NoError(t, reporter.Close())
+	for _, message := range messages() {
+		assert.Equal(t, "review", message.Properties[PropertyScreen])
+	}
 }
