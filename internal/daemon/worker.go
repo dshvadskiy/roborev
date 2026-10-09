@@ -46,8 +46,9 @@ type runningJobCancellation struct {
 }
 
 type pendingJobFailure struct {
-	job            *storage.ReviewJob
-	agent, message string
+	job      *storage.ReviewJob
+	message  string
+	onFailed func()
 }
 
 // WorkerPool manages a pool of review workers
@@ -1563,15 +1564,7 @@ func (wp *WorkerPool) finishRunningJob(workerID string, jobID int64) {
 		_, err := backoff.Retry(wp.stopCtx, func() (bool, error) {
 			var retryErr error
 			wp.runAttemptTransition(workerID, failure.job, func() {
-				updated, err := wp.failAttemptAndInvalidateBudget(failure.job, workerID, failure.agent, failure.message)
-				retryErr = err
-				if updated {
-					wp.broadcastFailed(failure.job, failure.agent, failure.message)
-					if wp.errorLog != nil {
-						wp.errorLog.LogError("worker", fmt.Sprintf("job %d failed: %s", jobID, failure.message), jobID)
-					}
-					wp.logJobFailed(jobID, workerID, failure.agent, failure.message)
-				}
+				_, retryErr = wp.failAttemptAndInvalidateBudget(failure.job, workerID, failure.message, failure.onFailed)
 			})
 			return true, retryErr
 		}, backoff.WithBackOff(backoff.NewConstantBackOff(5*time.Second)),
@@ -1592,15 +1585,18 @@ func (wp *WorkerPool) finishRunningJob(workerID string, jobID int64) {
 	}
 }
 
-func (wp *WorkerPool) failAttemptAndInvalidateBudget(job *storage.ReviewJob, workerID, agentName, errorMsg string) (bool, error) {
+func (wp *WorkerPool) failAttemptAndInvalidateBudget(job *storage.ReviewJob, workerID, errorMsg string, onFailed func()) (bool, error) {
 	updated, err := wp.failJobAndInvalidateBudget(job.ID, workerID, errorMsg)
 	if err != nil {
 		wp.runningJobsMu.Lock()
 		if running, ok := wp.runningJobs[job.ID]; ok {
-			running.pendingFailure = &pendingJobFailure{job: job, agent: agentName, message: errorMsg}
+			running.pendingFailure = &pendingJobFailure{job: job, message: errorMsg, onFailed: onFailed}
 			wp.runningJobs[job.ID] = running
 		}
 		wp.runningJobsMu.Unlock()
+	}
+	if updated {
+		onFailed()
 	}
 	return updated, err
 }
@@ -1803,14 +1799,15 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 	retried, err := wp.db.RetryJob(job.ID, workerID, maxRetries, wp.retryBackoff)
 	if err != nil {
 		log.Printf("[%s] Error retrying job: %v", workerID, err)
-		if updated, fErr := wp.failAttemptAndInvalidateBudget(job, workerID, agentName, wp.finalErrorMsg(agentName, errorMsg, agentError)); fErr != nil {
-			log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, fErr)
-		} else if updated {
+		onFailed := func() {
 			wp.broadcastFailed(job, agentName, errorMsg)
 			if wp.errorLog != nil {
 				wp.errorLog.LogError("worker", fmt.Sprintf("job %d failed: %s", job.ID, errorMsg), job.ID)
 			}
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
+		}
+		if _, fErr := wp.failAttemptAndInvalidateBudget(job, workerID, wp.finalErrorMsg(agentName, errorMsg, agentError), onFailed); fErr != nil {
+			log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, fErr)
 		}
 		return
 	}
@@ -1838,9 +1835,7 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 		}
 
 		// No backup or failover failed -- mark as failed
-		if updated, fErr := wp.failAttemptAndInvalidateBudget(job, workerID, agentName, wp.finalErrorMsg(agentName, errorMsg, agentError)); fErr != nil {
-			log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, fErr)
-		} else if updated {
+		onFailed := func() {
 			log.Printf("[%s] Job %d %s %sreview/%s failed after %d retries",
 				workerID, job.ID, job.RepoName,
 				reviewTypeTag(job.ReviewType), agentName,
@@ -1850,6 +1845,9 @@ func (wp *WorkerPool) failOrRetryInnerLocked(
 				wp.errorLog.LogError("worker", fmt.Sprintf("job %d failed after %d retries: %s", job.ID, maxRetries, errorMsg), job.ID)
 			}
 			wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
+		}
+		if _, fErr := wp.failAttemptAndInvalidateBudget(job, workerID, wp.finalErrorMsg(agentName, errorMsg, agentError), onFailed); fErr != nil {
+			log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, fErr)
 		}
 	}
 }
@@ -1882,9 +1880,7 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 		}
 	}
 
-	if updated, err := wp.failAttemptAndInvalidateBudget(job, workerID, agentName, errorMsg); err != nil {
-		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
-	} else if updated {
+	onFailed := func() {
 		log.Printf("[%s] Job %d %s %sreview/%s failed without retry: %s",
 			workerID, job.ID, job.RepoName,
 			reviewTypeTag(job.ReviewType), agentName, errorMsg)
@@ -1893,6 +1889,9 @@ func (wp *WorkerPool) failoverOrFailNonRetryableAgentLocked(
 			wp.errorLog.LogError("worker", fmt.Sprintf("job %d failed without retry: %s", job.ID, errorMsg), job.ID)
 		}
 		wp.logJobFailed(job.ID, workerID, agentName, errorMsg)
+	}
+	if _, err := wp.failAttemptAndInvalidateBudget(job, workerID, errorMsg, onFailed); err != nil {
+		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
 	}
 }
 
@@ -2341,9 +2340,7 @@ func (wp *WorkerPool) failJobWithPrefixLocked(
 	agentName, errorMsg, prefix, label string,
 ) {
 	storedMsg := prefixedFailure(prefix, errorMsg)
-	if updated, err := wp.failAttemptAndInvalidateBudget(job, workerID, agentName, storedMsg); err != nil {
-		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
-	} else if updated {
+	onFailed := func() {
 		log.Printf("[%s] Job %d skipped (agent %s %s)",
 			workerID, job.ID, agentName, label)
 		wp.broadcastFailed(job, agentName, storedMsg)
@@ -2353,6 +2350,9 @@ func (wp *WorkerPool) failJobWithPrefixLocked(
 				job.ID)
 		}
 		wp.logJobFailed(job.ID, workerID, agentName, storedMsg)
+	}
+	if _, err := wp.failAttemptAndInvalidateBudget(job, workerID, storedMsg, onFailed); err != nil {
+		log.Printf("[%s] Error failing job %d: %v", workerID, job.ID, err)
 	}
 }
 

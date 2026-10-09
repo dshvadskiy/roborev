@@ -3412,46 +3412,79 @@ func TestNonRetryableAgentErrorsSkipRetries(t *testing.T) {
 }
 
 func TestProcessJobRecoversFailedRefusalWrite(t *testing.T) {
-	tc := newWorkerTestContext(t, 1)
-	const message = "Access denied: web search is not authorized for this identity."
-	_, _, synthesis := enqueuePanelRun(t, tc, "recovery", []memberSpec{{name: "member", agent: "refusal-agent"}})
-	job := claimNext(t, tc)
-	_, err := tc.DB.Exec(`CREATE TRIGGER reject_failure BEFORE UPDATE OF status ON review_jobs WHEN NEW.status = 'failed' BEGIN SELECT RAISE(FAIL, 'write rejected'); END`)
-	require.NoError(t, err)
-	_, events := tc.Broadcaster.Subscribe("")
-	calls := 0
-	agent.RegisterForTest(t, &agent.FakeAgent{
-		NameStr: "refusal-agent",
-		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
-			calls++
-			return "", agent.WithLimitClassification(errors.New(message), agent.LimitClassification{Kind: agent.LimitKindPermanent, Agent: "codex"})
-		},
-	})
-	synctest.Test(t, func(t *testing.T) {
-		done := make(chan struct{})
-		go func() {
-			tc.Pool.processJob(testWorkerID, job)
-			close(done)
-		}()
-		synctest.Wait()
-		_, err := tc.DB.Exec(`DROP TRIGGER reject_failure`)
-		require.NoError(t, err)
-		<-done
-	})
-	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
-	assert := assert.New(t)
-	assert.Equal("agent: "+message, updated.Error)
-	assert.Equal(1, calls)
-	synth, err := tc.DB.GetJobByID(synthesis.ID)
-	require.NoError(t, err)
-	assert.False(synth.ClaimBlocked)
-	failed := 0
-	for len(events) > 0 {
-		if event := <-events; event.Type == "review.failed" {
-			failed++
-		}
+	for _, tt := range []struct {
+		name, message string
+		kind          agent.LimitKind
+		exhausted     bool
+		rejectRetry   bool
+	}{
+		{"refusal", "Access denied: web search is not authorized for this identity.", agent.LimitKindPermanent, false, false},
+		{"transient exhausted retries", "503 Service Unavailable", agent.LimitKindTransient, true, false},
+		{"transient rejected retry write", "503 Service Unavailable", agent.LimitKindTransient, false, true},
+		{"quota", "provider quota exhausted", agent.LimitKindQuota, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			tc.Pool.classify = func(string, string) agent.LimitClassification { return agent.LimitClassification{Kind: tt.kind} }
+			_, _, synthesis := enqueuePanelRun(t, tc, "recovery", []memberSpec{{name: "member", agent: "refusal-agent"}})
+			job := claimNext(t, tc)
+			if tt.exhausted {
+				_, err := tc.DB.Exec(`UPDATE review_jobs SET retry_count = ? WHERE id = ?`, maxRetries, job.ID)
+				require.NoError(t, err)
+			}
+			if tt.rejectRetry {
+				_, err := tc.DB.Exec(`CREATE TRIGGER reject_retry BEFORE UPDATE OF status ON review_jobs WHEN NEW.status = 'queued' BEGIN SELECT RAISE(FAIL, 'write rejected'); END`)
+				require.NoError(t, err)
+			}
+			_, err := tc.DB.Exec(`CREATE TRIGGER reject_failure BEFORE UPDATE OF status ON review_jobs WHEN NEW.status = 'failed' BEGIN SELECT RAISE(FAIL, 'write rejected'); END`)
+			require.NoError(t, err)
+			_, events := tc.Broadcaster.Subscribe("")
+			calls := 0
+			agent.RegisterForTest(t, &agent.FakeAgent{
+				NameStr: "refusal-agent",
+				ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+					calls++
+					return "", errors.New(tt.message)
+				},
+			})
+			synctest.Test(t, func(t *testing.T) {
+				done := make(chan struct{})
+				go func() {
+					tc.Pool.processJob(testWorkerID, job)
+					close(done)
+				}()
+				synctest.Wait()
+				_, err := tc.DB.Exec(`DROP TRIGGER reject_failure`)
+				require.NoError(t, err)
+				<-done
+			})
+			updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+			assert := assert.New(t)
+			eventMessage := "agent: " + tt.message
+			storedMessage := eventMessage
+			switch tt.kind {
+			case agent.LimitKindTransient:
+				storedMessage = review.OutageError(eventMessage)
+			case agent.LimitKindQuota:
+				eventMessage = review.QuotaErrorPrefix + eventMessage
+				storedMessage = eventMessage
+			}
+			assert.Equal(storedMessage, updated.Error)
+			assert.Equal(1, calls)
+			synth, err := tc.DB.GetJobByID(synthesis.ID)
+			require.NoError(t, err)
+			assert.False(synth.ClaimBlocked)
+			failed := 0
+			for len(events) > 0 {
+				if event := <-events; event.Type == "review.failed" {
+					failed++
+					assert.Equal("refusal-agent", event.Agent)
+					assert.Equal(eventMessage, event.Error)
+				}
+			}
+			assert.Equal(1, failed)
+		})
 	}
-	assert.Equal(1, failed)
 }
 
 func TestFailedStatusRecoveryPreservesAttemptGuards(t *testing.T) {
