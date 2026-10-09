@@ -2158,7 +2158,7 @@ func TestProcessJob_SmallDiffSucceedsWhenGitDirReadOnly(t *testing.T) {
 
 	agentCalled := false
 	agent.Register(&agent.FakeAgent{
-		NameStr: "refusal-agent",
+		NameStr: "codex",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
 			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
@@ -2208,7 +2208,7 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWhenGitDirReadOnly(t *testing.T
 
 	agentCalled := false
 	agent.Register(&agent.FakeAgent{
-		NameStr: "refusal-agent",
+		NameStr: "codex",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
 			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
