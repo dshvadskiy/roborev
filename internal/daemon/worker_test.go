@@ -2158,7 +2158,7 @@ func TestProcessJob_SmallDiffSucceedsWhenGitDirReadOnly(t *testing.T) {
 
 	agentCalled := false
 	agent.Register(&agent.FakeAgent{
-		NameStr: "codex",
+		NameStr: "refusal-agent",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
 			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
@@ -2208,7 +2208,7 @@ func TestProcessJob_LargeDiffUsesExternalSnapshotWhenGitDirReadOnly(t *testing.T
 
 	agentCalled := false
 	agent.Register(&agent.FakeAgent{
-		NameStr: "codex",
+		NameStr: "refusal-agent",
 		ReviewFn: func(ctx context.Context, repoPath, commitSHA, p string, output io.Writer) (string, error) {
 			agentCalled = true
 			return string(testutil.ReviewFixtureJSON("No issues found.")), nil
@@ -3372,16 +3372,22 @@ func TestNonRetryableAgentErrorsSkipRetries(t *testing.T) {
 		executionErr error
 		wantStatus   storage.JobStatus
 		wantError    string
+		cooling      bool
 	}{
-		{"unavailable without backup", "", agent.MarkUnavailable(errors.New("native package missing: platform helper absent")), storage.JobStatusFailed, review.UnavailableErrorPrefix + "agent: native package missing: platform helper absent"},
-		{"unavailable with backup", "test", agent.MarkUnavailable(errors.New("native package missing")), storage.JobStatusQueued, ""},
-		{"permission refusal", "", errors.New(message), storage.JobStatusFailed, "agent: " + message},
+		{"unavailable without backup", "", agent.MarkUnavailable(errors.New("native package missing: platform helper absent")), storage.JobStatusFailed, review.UnavailableErrorPrefix + "agent: native package missing: platform helper absent", false},
+		{"unavailable with backup", "test", agent.MarkUnavailable(errors.New("native package missing")), storage.JobStatusQueued, "", false},
+		{"permission refusal", "", errors.New(message), storage.JobStatusFailed, "agent: " + message, false},
+		{"permission refusal with backup", "test", errors.New(message), storage.JobStatusQueued, "", false},
+		{"permission refusal with cooling backup", "test", errors.New(message), storage.JobStatusFailed, "agent: " + message, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tc := newWorkerTestContext(t, 1)
 			cfg := config.DefaultConfig()
 			cfg.DefaultBackupAgent = tt.backup
 			tc.reconfigurePool(cfg)
+			if tt.cooling {
+				tc.Pool.cooldownAgent(tt.backup, time.Now().Add(time.Hour))
+			}
 			job := tc.createAndClaimJobWithAgent(t, "non-retryable", testWorkerID, "codex")
 			job.RepoPath = tc.TmpDir
 
@@ -3391,15 +3397,103 @@ func TestNonRetryableAgentErrorsSkipRetries(t *testing.T) {
 
 			updated := tc.assertJobStatus(t, job.ID, tt.wantStatus)
 			assert := assert.New(t)
-			if tt.backup != "" {
+			if tt.wantStatus == storage.JobStatusQueued {
 				assert.Equal(tt.backup, updated.Agent)
 			} else {
-				assert.Equal(tt.wantError, updated.Error)
+				assert.Equal("codex", updated.Agent)
 			}
+			assert.Equal(tt.wantError, updated.Error)
 			retries, err := tc.DB.GetJobRetryCount(job.ID)
 			require.NoError(t, err)
 			assert.Zero(retries)
 			assert.False(tc.Pool.isAgentCoolingDown("codex"))
+		})
+	}
+}
+
+func TestProcessJobRecoversFailedRefusalWrite(t *testing.T) {
+	tc := newWorkerTestContext(t, 1)
+	const message = "Access denied: web search is not authorized for this identity."
+	_, _, synthesis := enqueuePanelRun(t, tc, "recovery", []memberSpec{{name: "member", agent: "refusal-agent"}})
+	job := claimNext(t, tc)
+	_, err := tc.DB.Exec(`CREATE TRIGGER reject_failure BEFORE UPDATE OF status ON review_jobs WHEN NEW.status = 'failed' BEGIN SELECT RAISE(FAIL, 'write rejected'); END`)
+	require.NoError(t, err)
+	_, events := tc.Broadcaster.Subscribe("")
+	calls := 0
+	agent.RegisterForTest(t, &agent.FakeAgent{
+		NameStr: "refusal-agent",
+		ReviewFn: func(context.Context, string, string, string, io.Writer) (string, error) {
+			calls++
+			return "", agent.WithLimitClassification(errors.New(message), agent.LimitClassification{Kind: agent.LimitKindPermanent, Agent: "codex"})
+		},
+	})
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			tc.Pool.processJob(testWorkerID, job)
+			close(done)
+		}()
+		synctest.Wait()
+		_, err := tc.DB.Exec(`DROP TRIGGER reject_failure`)
+		require.NoError(t, err)
+		<-done
+	})
+	updated := tc.assertJobStatus(t, job.ID, storage.JobStatusFailed)
+	assert := assert.New(t)
+	assert.Equal("agent: "+message, updated.Error)
+	assert.Equal(1, calls)
+	synth, err := tc.DB.GetJobByID(synthesis.ID)
+	require.NoError(t, err)
+	assert.False(synth.ClaimBlocked)
+	failed := 0
+	for len(events) > 0 {
+		if event := <-events; event.Type == "review.failed" {
+			failed++
+		}
+	}
+	assert.Equal(1, failed)
+}
+
+func TestFailedStatusRecoveryPreservesAttemptGuards(t *testing.T) {
+	for _, action := range []string{"cancel", "ownership", "update", "shutdown"} {
+		t.Run(action, func(t *testing.T) {
+			tc := newWorkerTestContext(t, 1)
+			job := tc.createAndClaimJobWithAgent(t, "guard", testWorkerID, "codex")
+			_, events := tc.Broadcaster.Subscribe("")
+			_, err := tc.DB.Exec(`CREATE TRIGGER reject_failure BEFORE UPDATE OF status ON review_jobs WHEN NEW.status = 'failed' BEGIN SELECT RAISE(FAIL, 'write rejected'); END`)
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tc.Pool.registerRunningJob(job.ID, cancel, time.Now().Add(time.Hour))
+			tc.Pool.failoverOrFailNonRetryableAgentContext(ctx, testWorkerID, job, "codex", "refused")
+			wantStatus := storage.JobStatusRunning
+			synctest.Test(t, func(t *testing.T) {
+				done := make(chan struct{})
+				go func() { tc.Pool.finishRunningJob(testWorkerID, job.ID); close(done) }()
+				synctest.Wait()
+				switch action {
+				case "cancel":
+					require.NoError(t, tc.DB.CancelJob(job.ID))
+					require.True(t, tc.Pool.CancelJob(job.ID))
+					wantStatus = storage.JobStatusCanceled
+				case "ownership":
+					_, err := tc.DB.Exec(`UPDATE review_jobs SET worker_id = 'replacement' WHERE id = ?`, job.ID)
+					require.NoError(t, err)
+				case "update":
+					tc.Pool.InterruptJobsForUpdate([]int64{job.ID})
+					wantStatus = storage.JobStatusQueued
+				case "shutdown":
+					tc.Pool.stopCancel()
+				}
+				_, err := tc.DB.Exec(`DROP TRIGGER reject_failure`)
+				require.NoError(t, err)
+				<-done
+			})
+			updated := tc.assertJobStatus(t, job.ID, wantStatus)
+			assert.Empty(t, updated.Error)
+			for len(events) > 0 {
+				assert.NotEqual(t, "review.failed", (<-events).Type)
+			}
 		})
 	}
 }
