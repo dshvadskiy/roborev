@@ -38,7 +38,7 @@ func RunAgentReview(
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	document, err := agentReviewJSON(a, raw)
+	document, err := agentReviewJSON(raw)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -65,19 +65,19 @@ func RunAgentReview(
 // agentReviewJSON returns the review document in an agent's raw output.
 // Agents without a native schema mode rely on prompt instructions alone and
 // sometimes write prose before the document, often ending with a fenced json
-// block. That trailing document is recovered before any prose classification,
-// so narration that mentions a transient read failure cannot hide a valid
-// review; the decoder and validateLiveDocument then judge the document,
-// including unable_to_review. Output with no document is classified by
-// NoVerdict, and anything else is left for the decoder to reject.
-func agentReviewJSON(a agent.Agent, raw string) (jsontext.Value, error) {
+// block. Native schema adapters reject invalid JSON themselves, so only those
+// prompt-only agents reach the recovery. The trailing document is recovered
+// before any prose classification, so narration that mentions a transient
+// read failure cannot hide a valid review; the decoder and
+// validateLiveDocument then judge the document, including unable_to_review.
+// Output with no document is classified by NoVerdict, and anything else is
+// left for the decoder to reject.
+func agentReviewJSON(raw string) (jsontext.Value, error) {
 	if jsontext.Value(raw).IsValid() {
 		return jsontext.Value(raw), nil
 	}
-	if !agent.IsStructuredReviewAgent(a) {
-		if document := extractTrailingJSONObject(raw); document != "" {
-			return jsontext.Value(document), nil
-		}
+	if document := extractTrailingJSONObject(raw); document != "" {
+		return jsontext.Value(document), nil
 	}
 	if noVerdict := NoVerdict(raw); noVerdict != nil {
 		return nil, noVerdict

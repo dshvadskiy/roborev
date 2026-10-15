@@ -243,18 +243,6 @@ func TestRunAgentReviewClassifiesProseWithoutDocument(t *testing.T) {
 	assert.Equal(t, storage.OutputUnreadableInput, noVerdict.Kind)
 }
 
-func TestRunAgentReviewDoesNotRecoverNativeSchemaOutput(t *testing.T) {
-	a := &structuredBatchAgent{
-		name: "structured",
-		result: jsontext.Value(narratedReview(
-			"Checking the change.",
-			`{"schema_version":2,"summary":"Clean.","verdict":"pass","findings":[]}`,
-		)),
-	}
-	_, err := RunAgentReview(t.Context(), a, t.TempDir(), "HEAD", "prompt", "default", "", nil)
-	require.ErrorContains(t, err, "decode structured review")
-}
-
 func TestDecodeSynthesisResultRecoversJSONAfterNarration(t *testing.T) {
 	document := `{"schema_version":2,"summary":"Clean.","verdict":"pass","findings":[]}`
 	raw := narratedReview("I couldn't read the diff, so I compared the reviews.", document)

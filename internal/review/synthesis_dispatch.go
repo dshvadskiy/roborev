@@ -107,7 +107,7 @@ func decodeSynthesisResult(a agent.Agent, reviews []ReviewResult, raw jsontext.V
 	if err != nil {
 		return SynthesisDocument{}, err
 	}
-	document, err := agentReviewJSON(a, string(raw))
+	document, err := agentReviewJSON(string(raw))
 	if err != nil {
 		return SynthesisDocument{}, err
 	}
