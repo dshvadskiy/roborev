@@ -38,23 +38,11 @@ func RunAgentReview(
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	decodeInput := raw
-	if !jsontext.Value([]byte(raw)).IsValid() {
-		if noVerdict := NoVerdict(raw); noVerdict != nil {
-			return ReviewResult{}, noVerdict
-		}
-		// Agents without a native structured-output mode (no
-		// agent.StructuredReviewAgent, e.g. Kiro) rely on prompt
-		// instructions alone to return bare JSON. Under thorough
-		// reasoning they sometimes narrate their investigation first
-		// and land the JSON answer at the end, often inside a
-		// ```json fenced block. Recover that trailing object instead
-		// of failing the job outright.
-		if extracted := extractTrailingJSONObject(raw); extracted != "" {
-			decodeInput = extracted
-		}
+	document, err := agentReviewJSON(a, raw)
+	if err != nil {
+		return ReviewResult{}, err
 	}
-	structured, err := DecodeStructuredReview(jsontext.Value(decodeInput))
+	structured, err := DecodeStructuredReview(document)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -69,35 +57,48 @@ func RunAgentReview(
 		Output:           output,
 		Verdict:          storage.VerdictFromPassed(structured.Passed(minSeverity)),
 		Structured:       &structured,
-		StructuredOutput: append(jsontext.Value(nil), decodeInput...),
+		StructuredOutput: append(jsontext.Value(nil), document...),
 		MinSeverity:      minSeverity,
 	}, nil
 }
 
-// extractTrailingJSONObject recovers a JSON object narrated ahead of by prose,
-// optionally wrapped in a trailing ```-fenced code block. It scans forward for
-// the first '{' whose remainder parses as one complete, valid JSON value with
-// nothing left over, so stray braces earlier in the prose are skipped rather
-// than mismatched. Returns "" when no such object is found.
-//
-// ponytail: this is a textual heuristic, not a parser — it can be fooled by
-// prose that happens to contain a brace-balanced, otherwise-valid JSON object
-// before the real answer. Upgrade path: once Kiro (or any other
-// non-structured-output agent) exposes a true event stream with tool-call
-// boundaries, segment on that instead, as the JSONL-based adapters already do
-// via newTrailingReviewText.ResetAfterTool.
+// agentReviewJSON returns the review document in an agent's raw output.
+// Agents without a native schema mode rely on prompt instructions alone and
+// sometimes write prose before the document, often ending with a fenced json
+// block. That trailing document is recovered before any prose classification,
+// so narration that mentions a transient read failure cannot hide a valid
+// review; the decoder and validateLiveDocument then judge the document,
+// including unable_to_review. Output with no document is classified by
+// NoVerdict, and anything else is left for the decoder to reject.
+func agentReviewJSON(a agent.Agent, raw string) (jsontext.Value, error) {
+	if jsontext.Value(raw).IsValid() {
+		return jsontext.Value(raw), nil
+	}
+	if !agent.IsStructuredReviewAgent(a) {
+		if document := extractTrailingJSONObject(raw); document != "" {
+			return jsontext.Value(document), nil
+		}
+	}
+	if noVerdict := NoVerdict(raw); noVerdict != nil {
+		return nil, noVerdict
+	}
+	return jsontext.Value(raw), nil
+}
+
+// extractTrailingJSONObject returns the JSON object that ends the output,
+// optionally closed by a ``` fence. Only an object that starts a line is
+// tried, so braces inside prose cost nothing. The object must run to the end:
+// text after it, including after a closing fence, is not recovered. Returns ""
+// when no line starts a complete JSON value.
 func extractTrailingJSONObject(raw string) string {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimSpace(strings.TrimSuffix(s, "```"))
-	for i := strings.IndexByte(s, '{'); i >= 0; {
-		if jsontext.Value(s[i:]).IsValid() {
-			return s[i:]
+	offset := 0
+	for line := range strings.Lines(s) {
+		if strings.HasPrefix(line, "{") && jsontext.Value(s[offset:]).IsValid() {
+			return s[offset:]
 		}
-		next := strings.IndexByte(s[i+1:], '{')
-		if next < 0 {
-			return ""
-		}
-		i += 1 + next
+		offset += len(line)
 	}
 	return ""
 }
